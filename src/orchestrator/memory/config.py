@@ -188,10 +188,16 @@ class MemoryConfig(BaseModel):
 
         Priority:
         1. Explicit embedder_api_key setting
-        2. Provider-specific environment variable
+        2. SMART_GATEWAY_API_KEY — when embedder_api_base is set (embeddings routed
+           through the same gateway), reuse the gateway key automatically so users
+           don't need to set EMBEDDER_API_KEY separately.
+        3. Provider-specific environment variable
         """
         if self.embedder_api_key:
             return self.embedder_api_key
+
+        if self.embedder_api_base and settings.smart_gateway_api_key:
+            return settings.smart_gateway_api_key
 
         provider = self.embedder_provider.lower()
 
@@ -218,9 +224,45 @@ class MemoryConfig(BaseModel):
         return None
 
     def _build_llm_config(self) -> dict[str, Any]:
-        """Detect LLM provider from model name and build mem0 llm config block."""
+        """Build mem0's llm config block for fact extraction.
+
+        When the Smart Gateway is configured, route the memory LLM through it
+        as an OpenAI-compatible endpoint — mirroring the embedder
+        (``openai_base_url``) and ``llm.get_provider()``, which routes *all*
+        models through the gateway when ``SMART_GATEWAY_URL`` is set. This keeps
+        memory fact extraction on the same routing, credentials, and
+        observability path as agent inference, and removes the need for a
+        separate provider API key (e.g. ``GEMINI_API_KEY``).
+
+        Routing uses the gateway's native auto-routing (``auto/<tier>``) at the
+        ``cheap`` tier. This is the only tier compatible with mem0's
+        fact-extraction call shape — which combines a forced ``tool_choice``
+        with a ``json_schema`` response format: the ``mid``/``quality`` tiers
+        resolve to thinking models that reject forced tool calls (and any
+        ``temperature != 1``), and direct provider routes (e.g.
+        ``google/<model>``) reject ``json_schema``. The cheap tier also matches
+        ``MEMORY_LLM_MODEL``'s intent ("use cheap models for memory
+        operations") and stays within the configured model's provider family
+        (Gemini → ``gemini-2.0-flash``).
+
+        When no gateway is configured, fall back to direct per-provider routing
+        detected from the model name.
+        """
         model = self.memory_llm_model
 
+        # Smart Gateway: auto-routed cheap tier (only mem0-compatible route).
+        if settings.smart_gateway_url and settings.smart_gateway_api_key:
+            return {
+                "provider": "openai",
+                "config": {
+                    "model": "auto/cheap",
+                    "temperature": self.memory_llm_temperature,
+                    "api_key": settings.smart_gateway_api_key,
+                    "openai_base_url": settings.smart_gateway_url,
+                },
+            }
+
+        # Fallback: direct per-provider routing (no gateway configured).
         if model.startswith("gemini/") or model.startswith("gemini-"):
             model_name = model.removeprefix("gemini/") if model.startswith("gemini/") else model
             return {

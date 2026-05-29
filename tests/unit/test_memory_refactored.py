@@ -221,9 +221,16 @@ class TestMemoryConfig:
         )
         assert config.is_configured()
 
-    def test_to_mem0_config(self):
-        """Test conversion to mem0 config format."""
+    def test_to_mem0_config(self, monkeypatch):
+        """Test conversion to mem0 config format (direct per-provider fallback)."""
         logger.info("Test conversion to mem0 config format")
+        # Pin the gateway off so this exercises the direct per-provider path
+        # regardless of the developer's .env (see test_to_mem0_config_gateway
+        # for the Smart Gateway routing path).
+        from orchestrator.config import settings
+
+        monkeypatch.setattr(settings, "smart_gateway_url", None)
+        monkeypatch.setattr(settings, "smart_gateway_api_key", None)
         config = MemoryConfig(
             enabled=True,
             vector_store_provider="qdrant",
@@ -277,9 +284,13 @@ class TestMemoryConfig:
         )
         assert config.is_configured()
 
-    def test_to_mem0_config_milvus(self):
-        """Test conversion to mem0 config format with milvus."""
+    def test_to_mem0_config_milvus(self, monkeypatch):
+        """Test conversion to mem0 config format with milvus (direct fallback)."""
         logger.info("Test conversion to mem0 config format with milvus")
+        from orchestrator.config import settings
+
+        monkeypatch.setattr(settings, "smart_gateway_url", None)
+        monkeypatch.setattr(settings, "smart_gateway_api_key", None)
         config = MemoryConfig(
             enabled=True,
             vector_store_provider="milvus",
@@ -327,6 +338,37 @@ class TestMemoryConfig:
 
         assert mem0_config["vector_store"]["provider"] == "milvus"
         assert mem0_config["vector_store"]["config"]["token"] == "my-zilliz-token"
+
+    def test_to_mem0_config_gateway(self, monkeypatch):
+        """When the Smart Gateway is configured, the memory LLM routes through it.
+
+        Fact extraction is sent to the gateway's OpenAI-compatible endpoint at
+        the auto/cheap tier (the only tier compatible with mem0's json_schema +
+        forced tool_choice calls), reusing the gateway key — independent of
+        MEMORY_LLM_MODEL.
+        """
+        logger.info("Test memory LLM routes through Smart Gateway")
+        from orchestrator.config import settings
+
+        monkeypatch.setattr(settings, "smart_gateway_url", "https://gw.example.test/v1")
+        monkeypatch.setattr(settings, "smart_gateway_api_key", "gw-key-123")
+        config = MemoryConfig(
+            enabled=True,
+            vector_store_provider="milvus",
+            milvus_host="localhost",
+            milvus_port=19530,
+            memory_llm_model="gemini/gemini-2.5-flash",  # ignored on the gateway path
+            memory_llm_temperature=0.1,
+            embedder_model="text-embedding-3-small",
+            embedding_dims=1536,
+        )
+
+        llm = config.to_mem0_config()["llm"]
+
+        assert llm["provider"] == "openai"
+        assert llm["config"]["model"] == "auto/cheap"
+        assert llm["config"]["openai_base_url"] == "https://gw.example.test/v1"
+        assert llm["config"]["api_key"] == "gw-key-123"
 
 
 # =============================================================================
