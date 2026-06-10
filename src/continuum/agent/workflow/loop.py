@@ -81,6 +81,10 @@ class LoopAgent(BaseAgent):
     # Loop configuration
     loop_config: LoopConfig = field(default_factory=LoopConfig)
 
+    # Agent whose memory_config governs post-execution long-term memory writes.
+    # Defaults to the loop agent itself (the natural producer of the final output).
+    memory_agent: BaseAgent | None = None
+
     def __post_init__(self) -> None:
         """Initialize loop agent."""
         if not self.name:
@@ -112,110 +116,184 @@ class LoopAgent(BaseAgent):
         Returns:
             Final AgentResponse
         """
+        # Own the one decision trace spanning all iterations (rooted at this loop).
+        created = runner.ensure_recorder(context, self.name, input_text)
         context.suppress_session_log = True
         _orig_hist = self.agent.config.session_history_turns
         try:
-            current_input = input_text
-            iteration = 0
-            all_responses: list[AgentResponse] = []
-            total_usage = TokenUsage()
-            iteration_history: list[dict[str, Any]] = []
-
-            while iteration < self.termination.max_iterations:
-                iteration += 1
-
-                logger.info(
-                    f"Loop iteration {iteration}/{self.termination.max_iterations}",
-                    extra={"run_id": context.run_id, "iteration": iteration},
-                )
-
-                try:
-                    # Execute agent
-                    response = await runner.run(
-                        agent=self.agent,
-                        input=current_input,
-                        context=context,
-                    )
-
-                    all_responses.append(response)
-                    total_usage = total_usage.add(response.usage)
-
-                    # History only needed on iteration 1 — it doesn't change between
-                    # iterations (writes are blocked), so skip it from iteration 2 onwards.
-                    if iteration == 1:
-                        self.agent.config.session_history_turns = 0
-
-                    # Track iteration
-                    iteration_history.append(
-                        {
-                            "iteration": iteration,
-                            "input": current_input[:500],
-                            "output": (response.content or "")[:500],
-                        }
-                    )
-
-                    # Check termination
-                    should_terminate = await self._check_termination(
-                        response=response,
-                        iteration=iteration,
-                        history=iteration_history,
-                        llm_client=llm_client,
-                    )
-
-                    if should_terminate:
-                        logger.info(f"Loop terminated at iteration {iteration}")
-                        break
-
-                    # Prepare next iteration input
-                    current_input = self._build_next_input(
-                        original_input=input_text,
-                        last_output=response.content,
-                        iteration=iteration,
-                    )
-
-                except Exception as e:
-                    logger.error(f"Loop iteration {iteration} failed: {e}")
-                    raise LoopWorkflowError(
-                        f"Iteration {iteration} failed: {e}",
-                        iteration=iteration,
-                        run_id=context.run_id,
-                        original_error=e,
-                    ) from e
-
-            else:
-                # Max iterations reached without termination
-                if iteration >= self.termination.max_iterations:
-                    logger.warning(
-                        f"Loop reached max iterations ({self.termination.max_iterations})"
-                    )
-
-            # Return final response
-            final_response = (
-                all_responses[-1]
-                if all_responses
-                else AgentResponse(
-                    content="No iterations completed",
-                    status=ResponseStatus.ERROR,
-                )
+            result = await self._drive(
+                input_text,
+                runner,
+                context,
+                start_iteration=0,
+                original_input=input_text,
+                llm_client=llm_client,
             )
 
-            result = AgentResponse(
-                content=final_response.content,
-                structured_output=final_response.structured_output,
-                agent_name=self.name,
-                status=ResponseStatus.SUCCESS if all_responses else ResponseStatus.ERROR,
-                usage=total_usage,
-                turn_count=iteration,
-            )
-
-            if context.session_id and all_responses:
+            if context.session_id and result.turn_count:
                 await runner.save_turn(
                     session_id=context.session_id,
                     user_message=input_text,
-                    assistant_message=final_response.content or "",
-                    agent=None,
+                    assistant_message=result.content or "",
+                    agent=self.memory_agent,
                 )
 
+            if created:
+                await runner.persist_decision_trace(context, result)
+            return result
+        finally:
+            self.agent.config.session_history_turns = _orig_hist
+
+    async def _drive(
+        self,
+        current_input: str,
+        runner: AgentRunner,
+        context: RunContext,
+        *,
+        start_iteration: int,
+        original_input: str,
+        llm_client: LLMClient | None,
+    ) -> AgentResponse:
+        """Run iterations ``start_iteration..max`` and assemble the result.
+
+        ``start_iteration`` is the 0-based iteration index to begin at — 0 for a
+        fresh run, ``k`` when resuming a fork from iteration ``k`` so the new
+        trace's stage markers stay aligned with the parent's.
+        """
+        iteration = start_iteration
+        all_responses: list[AgentResponse] = []
+        total_usage = TokenUsage()
+        iteration_history: list[dict[str, Any]] = []
+
+        while iteration < self.termination.max_iterations:
+            iteration += 1
+
+            logger.info(
+                f"Loop iteration {iteration}/{self.termination.max_iterations}",
+                extra={"run_id": context.run_id, "iteration": iteration},
+            )
+
+            # Decision trace: mark the start of this iteration (0-based stage).
+            if context.recorder is not None:
+                context.recorder.record_workflow_step(
+                    self.name, stage=iteration - 1, label=self.agent.name, agent_stack=[self.name]
+                )
+
+            try:
+                response = await runner.run(
+                    agent=self.agent,
+                    input=current_input,
+                    context=context,
+                )
+
+                all_responses.append(response)
+                total_usage = total_usage.add(response.usage)
+
+                # History only needed on the first executed iteration — it doesn't
+                # change between iterations (writes are blocked), so skip it after.
+                if iteration == start_iteration + 1:
+                    self.agent.config.session_history_turns = 0
+
+                iteration_history.append(
+                    {
+                        "iteration": iteration,
+                        "input": current_input[:500],
+                        "output": (response.content or "")[:500],
+                    }
+                )
+
+                should_terminate = await self._check_termination(
+                    response=response,
+                    iteration=iteration,
+                    history=iteration_history,
+                    llm_client=llm_client,
+                )
+
+                if should_terminate:
+                    logger.info(f"Loop terminated at iteration {iteration}")
+                    break
+
+                current_input = self._build_next_input(
+                    original_input=original_input,
+                    last_output=response.content,
+                    iteration=iteration,
+                )
+
+            except Exception as e:
+                logger.error(f"Loop iteration {iteration} failed: {e}")
+                raise LoopWorkflowError(
+                    f"Iteration {iteration} failed: {e}",
+                    iteration=iteration,
+                    run_id=context.run_id,
+                    original_error=e,
+                ) from e
+        else:
+            if iteration >= self.termination.max_iterations:
+                logger.warning(f"Loop reached max iterations ({self.termination.max_iterations})")
+
+        final_response = (
+            all_responses[-1]
+            if all_responses
+            else AgentResponse(content="No iterations completed", status=ResponseStatus.ERROR)
+        )
+
+        result = AgentResponse(
+            content=final_response.content,
+            structured_output=final_response.structured_output,
+            agent_name=self.name,
+            status=ResponseStatus.SUCCESS if all_responses else ResponseStatus.ERROR,
+            usage=total_usage,
+            turn_count=iteration,
+            messages=final_response.messages,
+        )
+        result.run_id = context.run_id
+        return result
+
+    async def resume_from(
+        self,
+        *,
+        parent_trace: Any,
+        from_step: str,
+        override: dict[str, Any] | None,
+        runner: AgentRunner,
+        context: RunContext,
+    ) -> AgentResponse:
+        """Re-run the loop from the iteration containing ``from_step``.
+
+        Iterations before it are not re-run; the resumed iteration's input is
+        recovered from its first step's checkpoint (with ``override`` applied),
+        then the loop runs forward with its normal termination checks.
+        """
+        from continuum.agent.workflow._forkable import (
+            link_lineage,
+            resumed_input,
+            segment_by_markers,
+        )
+
+        step_stage, stage_first = segment_by_markers(parent_trace)
+        stage_idx = step_stage.get(from_step)
+        if stage_idx is None:
+            raise ValueError(f"resume_from: step '{from_step}' not found in trace")
+        stage_idx = max(0, min(stage_idx, self.termination.max_iterations - 1))
+
+        new_input = resumed_input(stage_first.get(stage_idx), override, parent_trace.user_query)
+
+        created = runner.ensure_recorder(context, self.name, parent_trace.user_query)
+        if created:
+            link_lineage(context, parent_trace, from_step, override, stage_idx)
+        context.suppress_session_log = True
+        _orig_hist = self.agent.config.session_history_turns
+        try:
+            result = await self._drive(
+                new_input,
+                runner,
+                context,
+                start_iteration=stage_idx,
+                original_input=parent_trace.user_query,
+                llm_client=None,
+            )
+            if created:
+                await runner.persist_decision_trace(context, result)
             return result
         finally:
             self.agent.config.session_history_turns = _orig_hist
@@ -352,6 +430,7 @@ def create_loop_agent(
     termination_tool: str | None = None,
     termination_pattern: str | None = None,
     termination_condition: Callable[[str, list[dict[str, Any]]], bool] | None = None,
+    memory_agent: BaseAgent | None = None,
 ) -> LoopAgent:
     """
     Factory function to create a loop agent.
@@ -387,4 +466,5 @@ def create_loop_agent(
         name=name,
         agent=agent,
         termination=termination,
+        memory_agent=memory_agent,
     )

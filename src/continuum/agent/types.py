@@ -91,6 +91,10 @@ class EventType(str, Enum):
     WORKFLOW_STEP = "workflow_step"
     LOOP_ITERATION = "loop_iteration"
 
+    # Decision-trace events — one per recorded trace step, so a streaming client
+    # can watch the decision trace build in real time (S2).
+    DECISION_STEP = "decision_step"
+
 
 class MemoryScope(str, Enum):
     """Scope for memory operations."""
@@ -537,6 +541,11 @@ class AgentResponse:
     trace_id: str | None = None
     span_id: str | None = None
 
+    # Decision trace (reasoning traceability). The ordered, tree-structured record
+    # of how this response was produced, shaped by DECISION_TRACE_DETAIL. None when
+    # tracing is disabled or detail is 'off'. The full trace is persisted by run_id.
+    decision_trace: dict[str, Any] | None = None
+
     # Multi-agent info
     agents_used: list[str] = field(default_factory=list)
     handoff_chain: list[str] = field(default_factory=list)
@@ -926,6 +935,11 @@ class RunContext:
     # own copy and cannot stomp on each other.
     suppress_session_log: bool = False
 
+    # Set by fork(): a forked run is a hypothetical ("what-if") replay, so it must
+    # never persist facts to long-term memory (that would pollute real memory with
+    # things that never happened). Honored in the session/memory save path.
+    disable_memory_writes: bool = False
+
     # Data sensitivity labels carried from Orla-style taint tracking.
     # Labels propagate through handoffs so downstream agents know what
     # sensitive categories (e.g. "pii", "phi") are in scope for this run.
@@ -936,6 +950,11 @@ class RunContext:
     # or any other runtime signal. The PriorityDispatcher uses this to order
     # API calls when multiple requests are queued for the same provider.
     priority: int = 5
+
+    # Decision-trace recorder for this run (a trace.recorder.TraceRecorder).
+    # Runtime-only: not serialized to Redis. Shared across handoffs/branches so
+    # the trace spans the whole run. None when DECISION_TRACE_ENABLED is false.
+    recorder: Any = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""

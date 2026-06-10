@@ -133,13 +133,36 @@ If the request doesn't clearly fit any specialist, respond with "none".
         `agents_used` chain so callers can see which specialist served
         the request.
         """
+        created = (
+            runner.ensure_recorder(context, self.name, input_text)
+            if context is not None and hasattr(runner, "ensure_recorder")
+            else False
+        )
+        result = await self._route_and_run(input_text, runner, context, forced_route=None)
+        if created and context is not None:
+            result.run_id = context.run_id
+            await runner.persist_decision_trace(context, result)
+        return result
+
+    async def _route_and_run(
+        self,
+        input_text: str,
+        runner: Any,
+        context: RunContext | None,
+        *,
+        forced_route: str | None,
+    ) -> Any:
+        """Resolve the route (or use ``forced_route``), record the routing
+        decision, and run the chosen specialist. Shared by ``execute`` and
+        ``resume_from``."""
         from continuum.agent.exceptions import (
             AgentNotFoundError,
             NoRouteFoundError,
         )
+        from continuum.agent.trace.types import StepKind
         from continuum.agent.types import AgentResponse, ResponseStatus
 
-        target_name = await self.route(
+        target_name = forced_route or await self.route(
             input_text,
             llm_client=runner.llm_client,
             context=context,
@@ -152,6 +175,18 @@ If the request doesn't clearly fit any specialist, respond with "none".
             else:
                 available = [r.agent_name for r in self.routes]
                 raise NoRouteFoundError(available_routes=available)
+
+        # Record the routing decision as a trace step (the resume point for a
+        # Router fork — "what if it had routed differently?").
+        if context is not None and context.recorder is not None:
+            context.recorder.record(
+                StepKind.ROUTING,
+                self.name,
+                agent_stack=[self.name],
+                input=input_text,
+                decision={"route": target_name, "forced": forced_route is not None},
+                rationale=f"routed to {target_name}",
+            )
 
         # Resolve target — registry first
         target_agent = runner.get_agent(target_name) if hasattr(runner, "get_agent") else None
@@ -187,6 +222,38 @@ If the request doesn't clearly fit any specialist, respond with "none".
             messages=target_response.messages,
             run_artifacts=target_response.run_artifacts,
         )
+
+    async def resume_from(
+        self,
+        *,
+        parent_trace: Any,
+        from_step: str,
+        override: dict[str, Any] | None,
+        runner: Any,
+        context: RunContext,
+    ) -> Any:
+        """Re-run the router from its routing decision.
+
+        ``override={"route": "<agent>"}`` forces a specific specialist
+        ("what if it had routed to X?"); ``override={"replace_last_user": ...}``
+        changes the request that gets routed. Otherwise the router re-routes the
+        original query. The parent run is never mutated.
+        """
+        override = override or {}
+        input_text = override.get("replace_last_user") or parent_trace.user_query
+        forced_route = override.get("route")
+
+        from continuum.agent.workflow._forkable import link_lineage
+
+        created = runner.ensure_recorder(context, self.name, parent_trace.user_query)
+        if created:
+            link_lineage(context, parent_trace, from_step, override, stage=0)
+
+        result = await self._route_and_run(input_text, runner, context, forced_route=forced_route)
+        result.run_id = context.run_id
+        if created:
+            await runner.persist_decision_trace(context, result)
+        return result
 
     async def route(
         self,

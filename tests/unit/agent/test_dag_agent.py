@@ -109,7 +109,10 @@ class TestDAGConstruction:
         ctx = _make_context()
         with _patch_span():
             with pytest.raises(AgentConfigurationError):
-                asyncio.get_event_loop().run_until_complete(dag.execute("input", runner, ctx))
+                # asyncio.run() rather than the deprecated get_event_loop(), which
+                # raises "no current event loop" once any async test has closed the
+                # session loop first (collection-order dependent).
+                asyncio.run(dag.execute("input", runner, ctx))
 
     def test_create_dag_agent_factory(self):
         dag = create_dag_agent(
@@ -354,3 +357,43 @@ class TestDAGFailStrategy:
 
         assert resp.status == ResponseStatus.SUCCESS
         assert "good_ok" in resp.content
+
+
+# ---------------------------------------------------------------------------
+# memory_agent propagation
+# ---------------------------------------------------------------------------
+
+
+class TestDAGMemoryAgent:
+    @pytest.mark.asyncio
+    async def test_save_turn_agent_is_none_by_default(self):
+        dag = DAGAgent(name="dag")
+        dag.add_stage("a", _make_agent("a"))
+        runner = _make_runner({"a": "result"})
+        ctx = _make_context()
+        ctx.session_id = "sess-1"
+        with _patch_span():
+            await dag.execute("input", runner, ctx)
+        runner.save_turn.assert_called_once()
+        assert runner.save_turn.call_args.kwargs["agent"] is None
+
+    @pytest.mark.asyncio
+    async def test_save_turn_uses_memory_agent_when_set(self):
+        mem_agent = _make_agent("mem")
+        dag = DAGAgent(name="dag", memory_agent=mem_agent)
+        dag.add_stage("a", _make_agent("a"))
+        runner = _make_runner({"a": "result"})
+        ctx = _make_context()
+        ctx.session_id = "sess-1"
+        with _patch_span():
+            await dag.execute("input", runner, ctx)
+        assert runner.save_turn.call_args.kwargs["agent"] is mem_agent
+
+    def test_create_dag_agent_passes_memory_agent(self):
+        mem_agent = _make_agent("mem")
+        dag = create_dag_agent(
+            name="pipeline",
+            stages=[("a", _make_agent("a"), [])],
+            memory_agent=mem_agent,
+        )
+        assert dag.memory_agent is mem_agent

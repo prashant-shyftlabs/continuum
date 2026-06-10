@@ -9,6 +9,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from continuum.agent.exceptions import MaxTurnsExceededError
+from continuum.agent.execution.trace_capture import (
+    capture_snapshot,
+    record_llm_turn,
+    record_tool_steps,
+)
 from continuum.agent.interfaces.executor_interface import IExecutor
 from continuum.agent.types import (
     AgentResponse,
@@ -274,6 +279,25 @@ class Executor(IExecutor):
                         model=agent.model,
                     )
 
+                from continuum.agent.utils.message_utils import message_to_dict
+
+                # Decision trace: checkpoint the exact messages SENT this turn —
+                # the true resume point for fork() — BEFORE the assistant output
+                # is appended below. (llm_messages aliases `messages` on the
+                # non-reasoning path, so this must be captured pre-append or the
+                # snapshot would also contain this turn's own answer and fork()
+                # would replay an already-finished conversation.)
+                recorder = context.recorder
+                # This agent's handoff stack (root → … → this agent), read from
+                # its OWN run_state per turn and passed into each record() call —
+                # never a shared recorder field — so concurrent agents can't
+                # clobber each other's stack. Recomputed each turn, so it's also
+                # correct after a return-to-parent handoff pops the child.
+                _agent_stack = run_state.get_agent_stack_snapshot()
+                # Checkpoint the messages sent this turn BEFORE the assistant
+                # output is appended below (shared with the streaming path).
+                _snapshot = capture_snapshot(recorder, llm_messages)
+
                 # Add assistant message
                 assistant_msg = {
                     "role": "assistant",
@@ -284,9 +308,20 @@ class Executor(IExecutor):
                         tc.to_dict() if hasattr(tc, "to_dict") else tc for tc in response.tool_calls
                     ]
                 messages.append(assistant_msg)
-                from continuum.agent.utils.message_utils import message_to_dict
 
                 run_state.messages = [message_to_dict(m) for m in messages]
+
+                # Record this turn's LLM decision (nests reasoning/tool steps below it).
+                llm_step_id = record_llm_turn(
+                    recorder,
+                    agent.name,
+                    turn,
+                    content=response.content,
+                    has_tool_calls=bool(response.tool_calls),
+                    usage=response.usage,
+                    snapshot=_snapshot,
+                    agent_stack=_agent_stack,
+                )
 
                 # Log LLM response details
                 if response.model and settings.smart_gateway_url:
@@ -373,6 +408,14 @@ class Executor(IExecutor):
                         except Exception:
                             thought = str(args_str)
                         logger.info(f"💭 Agent thought: {thought}")
+                        if recorder is not None:
+                            recorder.record_reasoning(
+                                agent.name,
+                                turn,
+                                thought,
+                                parent_id=llm_step_id,
+                                agent_stack=_agent_stack,
+                            )
                         messages.append(
                             {
                                 "role": "tool",
@@ -394,6 +437,17 @@ class Executor(IExecutor):
                         )
                         messages.extend(tool_results)
 
+                        if recorder is not None:
+                            record_tool_steps(
+                                recorder,
+                                agent.name,
+                                turn,
+                                regular_tool_calls,
+                                tool_results,
+                                parent_id=llm_step_id,
+                                agent_stack=_agent_stack,
+                            )
+
                         # Store the summary if tools were executed (capped to prevent leak)
                         if not turn_tool_summary.is_empty():
                             if len(all_tool_summaries) >= _MAX_TOOL_SUMMARIES:
@@ -409,6 +463,16 @@ class Executor(IExecutor):
                     # Execute handoffs sequentially (they may return early)
                     if handoff_calls and self._handoff_executor:
                         for tc, target in handoff_calls:
+                            if recorder is not None:
+                                _hc = agent.get_handoff(target)
+                                recorder.record_handoff(
+                                    agent.name,
+                                    target,
+                                    turn,
+                                    parent_id=llm_step_id,
+                                    agent_stack=_agent_stack,
+                                    return_to_parent=bool(_hc and _hc.return_to_parent),
+                                )
                             handoff_result = await self._handoff_executor.execute_handoff(
                                 agent=agent,
                                 target_name=target,
@@ -446,6 +510,9 @@ class Executor(IExecutor):
                                     # to the same target again on the next turn.
                                     run_state.pop_agent()
                                     run_state.current_agent = agent.name
+                                    # (No recorder-stack reset needed: the parent's
+                                    # next turn recomputes _agent_stack from run_state,
+                                    # which is back to the parent's stack after the pop.)
                                     turn_span.set_output(
                                         {
                                             "handoff_to": target,

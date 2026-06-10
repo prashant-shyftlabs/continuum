@@ -78,6 +78,10 @@ class SequentialAgent(BaseAgent):
     # Sequential configuration
     sequential_config: SequentialConfig = field(default_factory=SequentialConfig)
 
+    # Agent whose memory_config governs post-sequence long-term memory writes.
+    # If None (default), no memory is written after the sequence completes.
+    memory_agent: BaseAgent | None = None
+
     def __post_init__(self) -> None:
         """Initialize sequential agent."""
         # Skip base validation as we're a composite agent
@@ -108,6 +112,10 @@ class SequentialAgent(BaseAgent):
         Returns:
             Final AgentResponse from the pipeline
         """
+        # Own the one decision trace spanning all pipeline sub-agents (rooted at
+        # this workflow). Sub-runs share this recorder but are suppressed, so we
+        # persist it ourselves at the end.
+        _trace_created = runner.ensure_recorder(context, self.name, input_text)
         context.suppress_session_log = True
         try:
             current_input = input_text
@@ -137,6 +145,12 @@ class SequentialAgent(BaseAgent):
                         f"Sequential step {step_num}/{len(self.agents)}: {agent.name}",
                         extra={"run_id": context.run_id, "step": step_num},
                     )
+
+                    # Decision trace: mark the start of this pipeline stage.
+                    if context.recorder is not None:
+                        context.recorder.record_workflow_step(
+                            self.name, stage=i, label=agent.name, agent_stack=[self.name]
+                        )
 
                     # Create a span for each step in the pipeline
                     async with SpanScope(
@@ -260,13 +274,74 @@ class SequentialAgent(BaseAgent):
                     session_id=context.session_id,
                     user_message=input_text,
                     assistant_message=final_response.content or "",
-                    agent=None,
+                    agent=self.memory_agent,
                 )
+
+            if _trace_created:
+                await runner.persist_decision_trace(context, result)
 
             return result
         finally:
             if context.metadata is not None:
                 context.metadata.pop("pipeline_context", None)
+
+    # ------------------------------------------------------------------ #
+    # Forkable: resume the pipeline from the stage owning a step
+    # ------------------------------------------------------------------ #
+    def _segment_stages(self, trace: Any) -> tuple[dict[str, int], dict[int, Any]]:
+        """Map each step_id → pipeline stage index and stage index → its first
+        (snapshot-bearing) step. Delegates to the shared marker-based segmenter
+        (``_forkable.segment_by_markers``) used by every Forkable orchestrator."""
+        from continuum.agent.workflow._forkable import segment_by_markers
+
+        return segment_by_markers(trace)
+
+    async def resume_from(
+        self,
+        *,
+        parent_trace: Any,
+        from_step: str,
+        override: dict[str, Any] | None,
+        runner: AgentRunner,
+        context: RunContext,
+    ) -> AgentResponse:
+        """Re-run the pipeline from the stage containing ``from_step``.
+
+        Stages before the resume point are not re-run; the resumed stage's input
+        is recovered from its first step's message checkpoint (or replaced via
+        ``override={"replace_last_user": ...}``). The parent run is never mutated;
+        the new run records its lineage.
+        """
+        from continuum.agent.workflow._forkable import link_lineage, resumed_input
+
+        step_stage, stage_first = self._segment_stages(parent_trace)
+        stage_idx = step_stage.get(from_step)
+        if stage_idx is None:
+            raise ValueError(f"resume_from: step '{from_step}' not found in trace")
+        stage_idx = min(stage_idx, len(self.agents) - 1)
+
+        # Recover the resumed stage's input (last user message in its first step's
+        # checkpoint, with the override applied; falls back to the run query).
+        stage_input = resumed_input(stage_first.get(stage_idx), override, parent_trace.user_query)
+
+        # New trace rooted at this workflow, linked back to the parent.
+        created = runner.ensure_recorder(context, self.name, parent_trace.user_query)
+        if created:
+            link_lineage(context, parent_trace, from_step, override, stage_idx)
+
+        # Run the remaining stages as a sub-pipeline sharing this recorder.
+        tail = SequentialAgent(
+            name=self.name,
+            agents=self.agents[stage_idx:],
+            sequential_config=self.sequential_config,
+        )
+        result = await tail.execute(stage_input, runner, context)
+        # Surface the forked run's id (the workflow AgentResponse doesn't set it)
+        # so callers can load the persisted trace by run_id.
+        result.run_id = context.run_id
+        if created:
+            await runner.persist_decision_trace(context, result)
+        return result
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -287,6 +362,7 @@ def create_sequential_agent(
     *,
     pass_full_history: bool = False,
     fail_strategy: FailStrategy = FailStrategy.FAIL_FAST,
+    memory_agent: BaseAgent | None = None,
 ) -> SequentialAgent:
     """
     Factory function to create a sequential agent.
@@ -296,6 +372,7 @@ def create_sequential_agent(
         agents: List of agents to execute in order
         pass_full_history: Whether to pass full history to each agent
         fail_strategy: How to handle failures
+        memory_agent: Agent whose memory_config governs post-sequence long-term memory writes
 
     Returns:
         Configured SequentialAgent
@@ -303,6 +380,7 @@ def create_sequential_agent(
     return SequentialAgent(
         name=name,
         agents=agents,
+        memory_agent=memory_agent,
         sequential_config=SequentialConfig(
             pass_full_history=pass_full_history,
             fail_strategy=fail_strategy,
