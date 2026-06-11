@@ -1,7 +1,7 @@
 """
 Integration tests — Adversarial Redis session scenarios (Issue #21).
 
-Goal: try to BREAK the Redis-backed session layer in src/orchestrator/session/.
+Goal: try to BREAK the Redis-backed session layer in src/continuum/session/.
 Covers:
   A. Cross-conversation bleed (session_id derivation, isolation)
   B. TTL expiry mid-conversation
@@ -34,7 +34,7 @@ pytestmark = pytest.mark.integration
 
 def _make_config(**overrides):
     """Return a SessionConfig pointed at the test Redis instance."""
-    from orchestrator.session.config import SessionConfig
+    from continuum.session.config import SessionConfig
 
     defaults = {
         "enabled": True,
@@ -53,7 +53,7 @@ def _make_config(**overrides):
 
 def _make_provider(**config_overrides):
     """Create + initialize a RedisSessionProvider. Skips test if Redis is unavailable."""
-    from orchestrator.session.providers.redis import RedisSessionProvider
+    from continuum.session.providers.redis import RedisSessionProvider
 
     p = RedisSessionProvider(config=_make_config(**config_overrides), auto_initialize=False)
     ok = p.initialize()
@@ -63,7 +63,7 @@ def _make_provider(**config_overrides):
 
 
 def _msg(role: str = "user", content: str = "test message"):
-    from orchestrator.llm.types import ChatMessage
+    from continuum.llm.types import ChatMessage
 
     return ChatMessage(role=role, content=content)
 
@@ -161,7 +161,7 @@ class TestTTLExpiry:
         After a session's TTL has elapsed, add_message must raise SessionNotFoundError —
         not silently succeed or raise a generic exception.
         """
-        from orchestrator.session.exceptions import SessionNotFoundError
+        from continuum.session.exceptions import SessionNotFoundError
 
         p = _make_provider(ttl_seconds=2)
         sid = await p.get_or_create_session(session_id=f"ttl-expire-{test_id}")
@@ -286,7 +286,7 @@ class TestMessageLimitStrategies:
         With max_messages=3 and strategy='error', the 4th add_message must raise
         SessionMessageLimitError with correct current_count and max_messages fields.
         """
-        from orchestrator.session.exceptions import SessionMessageLimitError
+        from continuum.session.exceptions import SessionMessageLimitError
 
         p = _make_provider(max_messages=3, message_limit_strategy="error")
         sid = f"limit-err-{test_id}"
@@ -313,7 +313,7 @@ class TestMessageLimitStrategies:
         clear_session resets message_count to 0. Subsequent messages must succeed
         without raising SessionMessageLimitError.
         """
-        from orchestrator.session.exceptions import SessionMessageLimitError
+        from continuum.session.exceptions import SessionMessageLimitError
 
         p = _make_provider(max_messages=3, message_limit_strategy="error")
         sid = f"limit-clear-{test_id}"
@@ -480,7 +480,7 @@ class TestConnectionFailures:
         Redis uses lazy connections — the pool is created eagerly but connects on
         first command, so initialize() should return without raising.
         """
-        from orchestrator.session.providers.redis import RedisSessionProvider
+        from continuum.session.providers.redis import RedisSessionProvider
 
         p = RedisSessionProvider(config=_make_config(redis_port=6399), auto_initialize=False)
         try:
@@ -494,8 +494,8 @@ class TestConnectionFailures:
         The first operation against an unreachable port must raise SessionConnectionError
         and must complete within the configured socket timeout (not hang for 30+ seconds).
         """
-        from orchestrator.session.exceptions import SessionConnectionError
-        from orchestrator.session.providers.redis import RedisSessionProvider
+        from continuum.session.exceptions import SessionConnectionError
+        from continuum.session.providers.redis import RedisSessionProvider
 
         p = RedisSessionProvider(config=_make_config(redis_port=6399), auto_initialize=False)
         p.initialize()
@@ -515,8 +515,8 @@ class TestConnectionFailures:
         A provider configured with the wrong password must raise SessionConnectionError
         on the first Redis operation — not an unhandled AuthenticationError or hang.
         """
-        from orchestrator.session.exceptions import SessionConnectionError
-        from orchestrator.session.providers.redis import RedisSessionProvider
+        from continuum.session.exceptions import SessionConnectionError
+        from continuum.session.providers.redis import RedisSessionProvider
 
         p = RedisSessionProvider(
             config=_make_config(redis_password="definitely-wrong-password-xyz"),
@@ -768,7 +768,7 @@ class TestResourceLeaks:
         When an operation fails (session not found, limit exceeded), the connection
         must still be returned to the pool — errors must not hold connections open.
         """
-        from orchestrator.session.exceptions import SessionNotFoundError
+        from continuum.session.exceptions import SessionNotFoundError
 
         p = _make_provider(ttl_seconds=2)
         pool = p._redis.connection_pool
@@ -966,7 +966,7 @@ class TestRetriesBackoff:
         setting is broken and all production requests would queue up silently.
         """
         import time
-        from orchestrator.session.providers.redis import RedisSessionProvider
+        from continuum.session.providers.redis import RedisSessionProvider
 
         p = RedisSessionProvider(config=_make_config(redis_port=6399), auto_initialize=False)
         p.initialize()
@@ -1000,7 +1000,7 @@ class TestRetriesBackoff:
         this test should be updated to verify the retry count and backoff delays.
         """
         import time
-        from orchestrator.session.providers.redis import RedisSessionProvider
+        from continuum.session.providers.redis import RedisSessionProvider
 
         p = RedisSessionProvider(config=_make_config(redis_port=6399), auto_initialize=False)
         p.initialize()
@@ -1036,7 +1036,7 @@ class TestRetriesBackoff:
         This simulates: Redis blips for a moment, caller catches the error,
         retries manually, and the provider does not stay in a broken state.
         """
-        from orchestrator.session.providers.redis import RedisSessionProvider
+        from continuum.session.providers.redis import RedisSessionProvider
 
         # Step 1: Attempt an operation that fails (wrong port)
         bad_provider = RedisSessionProvider(
@@ -1113,7 +1113,7 @@ class TestTraceMetricCompleteness:
         connection failures or data loss in production.
         """
         from unittest.mock import patch
-        from orchestrator.session.providers.redis import RedisSessionProvider
+        from continuum.session.providers.redis import RedisSessionProvider
 
         p = RedisSessionProvider(config=_make_config(redis_port=6399), auto_initialize=False)
         p.initialize()
@@ -1297,7 +1297,7 @@ class TestIdentifierSanitization:
         SECURE expectation: whitespace-only id rejected or trimmed to empty→UUID.
         Current behavior: FAILS — 'u:   ' bucket created silently.
         """
-        from orchestrator.session.exceptions import SessionError
+        from continuum.session.exceptions import SessionError
 
         p = _make_provider()
         sid = None
@@ -1393,7 +1393,7 @@ class TestIdentifierSanitization:
 
         This test asserts the SECURE outcome (non-string is rejected) — it passes.
         """
-        from orchestrator.session.exceptions import SessionError
+        from continuum.session.exceptions import SessionError
 
         p = _make_provider()
         try:
