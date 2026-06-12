@@ -313,7 +313,6 @@ class TestMessageLimitStrategies:
         clear_session resets message_count to 0. Subsequent messages must succeed
         without raising SessionMessageLimitError.
         """
-        from continuum.session.exceptions import SessionMessageLimitError
 
         p = _make_provider(max_messages=3, message_limit_strategy="error")
         sid = f"limit-clear-{test_id}"
@@ -966,6 +965,7 @@ class TestRetriesBackoff:
         setting is broken and all production requests would queue up silently.
         """
         import time
+
         from continuum.session.providers.redis import RedisSessionProvider
 
         p = RedisSessionProvider(config=_make_config(redis_port=6399), auto_initialize=False)
@@ -1000,6 +1000,7 @@ class TestRetriesBackoff:
         this test should be updated to verify the retry count and backoff delays.
         """
         import time
+
         from continuum.session.providers.redis import RedisSessionProvider
 
         p = RedisSessionProvider(config=_make_config(redis_port=6399), auto_initialize=False)
@@ -1113,6 +1114,7 @@ class TestTraceMetricCompleteness:
         connection failures or data loss in production.
         """
         from unittest.mock import patch
+
         from continuum.session.providers.redis import RedisSessionProvider
 
         p = RedisSessionProvider(config=_make_config(redis_port=6399), auto_initialize=False)
