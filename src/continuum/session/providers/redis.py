@@ -428,9 +428,7 @@ class RedisSessionProvider(BaseSessionProvider):
             # results[0] is the RPUSH return value = new list length
             session_metadata.message_count = results[0]
             metadata_json_updated = json.dumps(session_metadata.to_dict())
-            await self._redis.set(
-                metadata_key, metadata_json_updated, ex=self._config.ttl_seconds
-            )
+            await self._redis.set(metadata_key, metadata_json_updated, ex=self._config.ttl_seconds)
 
             logger.debug(
                 f"Added message to session: {session_id}",
@@ -525,7 +523,9 @@ class RedisSessionProvider(BaseSessionProvider):
             session_metadata.last_accessed_at = datetime.now(UTC)
             async with self._redis.pipeline(transaction=True) as pipe:
                 pipe.set(
-                    metadata_key, json.dumps(session_metadata.to_dict()), ex=self._config.ttl_seconds
+                    metadata_key,
+                    json.dumps(session_metadata.to_dict()),
+                    ex=self._config.ttl_seconds,
                 )
                 pipe.expire(messages_key, self._config.ttl_seconds)
                 await pipe.execute()

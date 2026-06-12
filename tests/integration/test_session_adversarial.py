@@ -89,9 +89,7 @@ async def provider():
 class TestCrossConversationBleed:
     """Verify that session_id derivation prevents messages leaking across users/windows."""
 
-    async def test_same_conv_id_different_users_produce_different_sessions(
-        self, provider, test_id
-    ):
+    async def test_same_conv_id_different_users_produce_different_sessions(self, provider, test_id):
         """
         Key formula: c:{conv_id}:u:{user_id}
         Two users sharing a conversation_id must never share a session.
@@ -227,9 +225,9 @@ class TestConcurrentWrites:
         sid = await provider.get_or_create_session(session_id=f"conc-write-{test_id}")
 
         n = 50
-        await asyncio.gather(*[
-            provider.add_message(sid, _msg(content=f"msg-{i}")) for i in range(n)
-        ])
+        await asyncio.gather(
+            *[provider.add_message(sid, _msg(content=f"msg-{i}")) for i in range(n)]
+        )
 
         messages_key = f"orchestrator:session:{sid}:messages"
         actual_llen = await provider._redis.llen(messages_key)
@@ -245,9 +243,7 @@ class TestConcurrentWrites:
 
         await provider.delete_session(sid)
 
-    async def test_concurrent_get_or_create_same_key_no_duplicate_session(
-        self, provider, test_id
-    ):
+    async def test_concurrent_get_or_create_same_key_no_duplicate_session(self, provider, test_id):
         """
         20 concurrent get_or_create_session calls with identical (user_id, conversation_id)
         must all return the same session_id — the SET NX guard must prevent duplicates.
@@ -255,10 +251,12 @@ class TestConcurrentWrites:
         user_id = f"user-conc-{test_id}"
         conv_id = f"conv-conc-{test_id}"
 
-        results = await asyncio.gather(*[
-            provider.get_or_create_session(user_id=user_id, conversation_id=conv_id)
-            for _ in range(20)
-        ])
+        results = await asyncio.gather(
+            *[
+                provider.get_or_create_session(user_id=user_id, conversation_id=conv_id)
+                for _ in range(20)
+            ]
+        )
 
         unique = set(results)
         assert len(unique) == 1, (
@@ -429,7 +427,7 @@ class TestAdversarialInputs:
         without byte-order corruption or character substitution.
         """
         sid = await provider.get_or_create_session(session_id=f"rtl-emoji-{test_id}")
-        content = "مرحبا بالعالم 🌍 שלום עולם 🎉 \u200F\u202B mixed"
+        content = "مرحبا بالعالم 🌍 שלום עולם 🎉 \u200f\u202b mixed"
 
         await provider.add_message(sid, _msg(content=content))
 
@@ -626,7 +624,9 @@ class TestKeyInjection:
             except Exception as exc:
                 # Raising a clear exception is also acceptable — it means the provider
                 # detected the invalid input rather than silently corrupting the key.
-                assert "session" in type(exc).__name__.lower() or isinstance(exc, (ValueError, TypeError)), (
+                assert "session" in type(exc).__name__.lower() or isinstance(
+                    exc, (ValueError, TypeError)
+                ), (
                     f"session_id with {char_name} raised an unexpected low-level exception: {exc!r}. "
                     "Expected a SessionError, ValueError, or TypeError — not a raw Redis error."
                 )
@@ -843,9 +843,9 @@ class TestPerformanceLatency:
             latencies.append((time.perf_counter() - start) * 1000)
 
         latencies.sort()
-        p50  = latencies[int(len(latencies) * 0.50)]
-        p95  = latencies[int(len(latencies) * 0.95)]
-        p99  = latencies[int(len(latencies) * 0.99)]
+        p50 = latencies[int(len(latencies) * 0.50)]
+        p95 = latencies[int(len(latencies) * 0.95)]
+        p99 = latencies[int(len(latencies) * 0.99)]
         minimum = latencies[0]
         maximum = latencies[-1]
 
@@ -882,9 +882,9 @@ class TestPerformanceLatency:
             latencies.append((time.perf_counter() - start) * 1000)
 
         latencies.sort()
-        p50  = latencies[int(len(latencies) * 0.50)]
-        p95  = latencies[int(len(latencies) * 0.95)]
-        p99  = latencies[int(len(latencies) * 0.99)]
+        p50 = latencies[int(len(latencies) * 0.50)]
+        p95 = latencies[int(len(latencies) * 0.95)]
+        p99 = latencies[int(len(latencies) * 0.99)]
         minimum = latencies[0]
         maximum = latencies[-1]
 
@@ -920,9 +920,9 @@ class TestPerformanceLatency:
             session_ids.append(sid)
 
         latencies.sort()
-        p50  = latencies[int(len(latencies) * 0.50)]
-        p95  = latencies[int(len(latencies) * 0.95)]
-        p99  = latencies[int(len(latencies) * 0.99)]
+        p50 = latencies[int(len(latencies) * 0.50)]
+        p95 = latencies[int(len(latencies) * 0.95)]
+        p99 = latencies[int(len(latencies) * 0.99)]
         minimum = latencies[0]
         maximum = latencies[-1]
 
@@ -1059,9 +1059,7 @@ class TestRetriesBackoff:
         # This simulates the caller retrying after Redis recovers
         good_provider = _make_provider()
         try:
-            sid = await good_provider.get_or_create_session(
-                session_id=f"recovery-good-{test_id}"
-            )
+            sid = await good_provider.get_or_create_session(session_id=f"recovery-good-{test_id}")
             await good_provider.add_message(sid, _msg(content="recovery message"))
             msgs = await good_provider.get_messages(sid)
 
@@ -1157,7 +1155,9 @@ class TestTraceMetricCompleteness:
                     await p.add_message(sid, _msg(content=f"msg-{i}"))
 
             info_calls = [str(c) for c in mock_logger.info.call_args_list]
-            assert any("trimmed" in c.lower() or "sliding window" in c.lower() for c in info_calls), (
+            assert any(
+                "trimmed" in c.lower() or "sliding window" in c.lower() for c in info_calls
+            ), (
                 "logger.info was not called with trim details when sliding window triggered. "
                 "Silent history drops are undetectable in production logs. "
                 f"Info calls recorded: {info_calls}"
@@ -1426,9 +1426,7 @@ class TestIdentifierSanitization:
             return await provider.update_session_metadata(sid, base)
 
         # 8 concurrent updates — stays under the default pool size (10)
-        results = await asyncio.gather(
-            *[update_with(i) for i in range(8)], return_exceptions=True
-        )
+        results = await asyncio.gather(*[update_with(i) for i in range(8)], return_exceptions=True)
         errors = [r for r in results if isinstance(r, Exception)]
         assert not errors, f"Concurrent metadata updates raised: {errors}"
 
