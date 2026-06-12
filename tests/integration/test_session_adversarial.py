@@ -1094,7 +1094,7 @@ class TestTraceMetricCompleteness:
         from unittest.mock import patch
 
         sid = f"trace-create-{test_id}"
-        with patch("orchestrator.session.providers.redis.logger") as mock_logger:
+        with patch("continuum.session.providers.redis.logger") as mock_logger:
             await provider.get_or_create_session(session_id=sid)
 
         # info() must have been called at least once with the session_id in the message
@@ -1118,7 +1118,7 @@ class TestTraceMetricCompleteness:
         p = RedisSessionProvider(config=_make_config(redis_port=6399), auto_initialize=False)
         p.initialize()
 
-        with patch("orchestrator.session.providers.redis.logger") as mock_logger:
+        with patch("continuum.session.providers.redis.logger") as mock_logger:
             try:
                 await asyncio.wait_for(
                     p.get_or_create_session(session_id=f"trace-err-{test_id}"),
@@ -1150,7 +1150,7 @@ class TestTraceMetricCompleteness:
         try:
             await p.get_or_create_session(session_id=sid)
 
-            with patch("orchestrator.session.providers.redis.logger") as mock_logger:
+            with patch("continuum.session.providers.redis.logger") as mock_logger:
                 for i in range(5):
                     await p.add_message(sid, _msg(content=f"msg-{i}"))
 
@@ -1178,7 +1178,7 @@ class TestTraceMetricCompleteness:
         sid = f"trace-delete-{test_id}"
         await provider.get_or_create_session(session_id=sid)
 
-        with patch("orchestrator.session.providers.redis.logger") as mock_logger:
+        with patch("continuum.session.providers.redis.logger") as mock_logger:
             await provider.delete_session(sid)
 
         info_calls = [str(c) for c in mock_logger.info.call_args_list]
@@ -1241,7 +1241,7 @@ class TestIdentifierSanitization:
 
         p = _make_provider()
         try:
-            with patch("orchestrator.session.providers.redis.logger") as mock_logger:
+            with patch("continuum.session.providers.redis.logger") as mock_logger:
                 sid = await p.get_or_create_session(user_id=malicious_user)
 
             logged = " ".join(str(c) for c in mock_logger.info.call_args_list)
